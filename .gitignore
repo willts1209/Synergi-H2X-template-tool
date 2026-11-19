@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+build/
+dist/
+*.spec
+selftest/
+ci_sample_h2x.pdf
+# never commit client drawings
+*.tmp.pdf
+/output/

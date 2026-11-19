@@ -1,0 +1,70 @@
+name: Build Windows EXE
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Run tests (drawing untouched, title block values, layout)
+        run: python -m pytest -q tests
+      - name: Build Windows application
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name SynergiH2XDrawings
+          --add-data "h2x_template/assets;h2x_template/assets"
+          --collect-all pypdfium2 --collect-all pypdfium2_raw --collect-all pikepdf
+          --collect-all pdfplumber --collect-all pdfminer
+          --collect-submodules fontTools
+          h2x_app.py
+      - name: Make synthetic H2X export
+        run: python tests/make_sample_h2x.py ci_sample_h2x.pdf
+      - name: Self-test the packaged EXE (generate + validate every sheet)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path selftest | Out-Null
+          $p = Start-Process -FilePath '.\dist\SynergiH2XDrawings.exe' -ArgumentList '--self-test','ci_sample_h2x.pdf','selftest' -PassThru -Wait
+          Get-Content selftest\self_test_report.json
+          if ($p.ExitCode -ne 0) { throw "Self-test failed with exit code $($p.ExitCode)" }
+          if (-not (Get-ChildItem selftest\*.pdf)) { throw "No output PDF" }
+      - name: GUI smoke test and screenshot
+        shell: pwsh
+        run: |
+          $h = (Resolve-Path 'ci_sample_h2x.pdf').Path
+          $app = Start-Process -FilePath '.\dist\SynergiH2XDrawings.exe' -ArgumentList '--preload',"`"$h`"" -PassThru
+          try {
+            Start-Sleep -Seconds 25
+            if ($app.HasExited) { throw "App exited during startup (code $($app.ExitCode))" }
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("$PWD\selftest\gui_screenshot.png")
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SynergiH2XDrawings-Windows
+          path: dist/SynergiH2XDrawings.exe
+          retention-days: 30
+      - name: Upload build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-evidence
+          path: selftest/
+          retention-days: 30
