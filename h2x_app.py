@@ -1,8 +1,10 @@
-"""Synergi H2X Drawing Tool - puts H2X heat loss sheets into the Synergi A3 drawing template.
+"""Synergi H2X Drawing Tool - puts an H2X heat loss export into the Synergi A3 drawing template.
+
+Makes three sheets from one H2X page: plan & isometric, plan only, isometric only.
 
 Run ``python h2x_app.py``.  Packaged as SynergiH2XDrawings.exe by GitHub Actions.
 
-``--self-test H2X.pdf OUTDIR``   generate every sheet without the window (CI)
+``--self-test H2X.pdf OUTDIR``   generate the sheets without the window (CI)
 ``--preload H2X.pdf``            open the window with an H2X PDF already loaded
 """
 from __future__ import annotations
@@ -18,7 +20,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from h2x_template import worker
-from h2x_template.compose import Job, SheetSpec
+from h2x_template.compose import VIEWS, Job, SheetSpec, default_sheets
 from h2x_template.template import REV_KEYS, bump_number, default_template
 
 APP_TITLE = "Synergi H2X Drawing Tool"
@@ -30,10 +32,6 @@ STATUSES = [
     "S4 - Suitable for Stage Approval",
     "A - Approved / Construction",
 ]
-CROP_MODES = [("content", "Drawing only (trimmed to what H2X drew)"),
-              ("frame", "Whole H2X drawing frame"),
-              ("page", "Whole H2X sheet, including H2X's title column")]
-SCALE_MODES = [("standard", "Standard scale (e.g. 1:125)"), ("fit", "Fit to sheet (NTS)")]
 
 
 def today() -> str:
@@ -61,6 +59,11 @@ def save_settings(d: dict):
         pass
 
 
+def best_page(pages: list) -> int:
+    """First H2X page that has both a plan and an isometric."""
+    return next((p["index"] for p in pages if not p["split_error"]), 0)
+
+
 # ------------------------------------------------------------------------------ headless
 def self_test(argv) -> int:
     h2x, outdir = argv[:2]
@@ -68,16 +71,15 @@ def self_test(argv) -> int:
     try:
         info = worker.analyse(h2x, str(default_template()))
         d = info["defaults"]
-        sheets = [SheetSpec(s["index"], s["title"], bump_number(d["document_number"], k))
-                  for k, s in enumerate(info["sheets"])]
+        sheets = default_sheets(d["document_number"], best_page(info["pages"]))
         rows = [dict(rev="P01", date=today(), description="Initial Issue", drn="WTS", chk="SH"),
                 dict(rev="P02", date=today(), description="Self-test revision", drn="WTS", chk="SH")]
         job = Job(str(default_template()), h2x, sheets,
                   dict(project="SES-P-000 Self Test", client="Self Test Client\n1 Test Street",
                        status=STATUSES[3], drawn="CI", date=today(), rev="P02"),
-                  rows, "Self-test note.", output_dir=outdir, combined=True)
+                  rows, "Self-test note.", output_dir=outdir)
         res = worker.generate(job)
-        result = {"ok": not res["error"] and all(r["ok"] for r in res["results"]) and len(res["results"]) > 0,
+        result = {"ok": not res["error"] and len(res["results"]) == 3 and all(r["ok"] for r in res["results"]),
                   **res}
         # the window does its work in a worker process - check that works in this build too
         ctx = multiprocessing.get_context("spawn")
@@ -188,78 +190,42 @@ def run_gui(preload=None, _mainloop=True):
         except Exception:  # noqa: BLE001
             pass
 
-    class SheetRow:
-        def __init__(self, app, s):
-            self.app = app
-            self.index = s["index"]
-            self.level = s["level"] or f"Page {s['index'] + 1}"
-            self.use = tk.BooleanVar(value=True)
-            self.title = tk.StringVar(value=s["title"])
-            self.doc = tk.StringVar()
-            self.scale = tk.StringVar(value="")
-            self.doc_typed = False
-            self.use.trace_add("write", lambda *_: (app.renumber(), app.changed()))
-            self.title.trace_add("write", lambda *_: app.changed())
-            self.doc.trace_add("write", lambda *_: self._doc_changed())
-            self.widgets = []
-
-        def _doc_changed(self):
-            if self.app._setting_doc:
-                return
-            self.doc_typed = True
-            if self.app.rows and self.app.rows[0] is self:
-                self.app.renumber()
-            self.app.changed()
-
-        def grid(self, parent, r):
-            w = [ttk.Checkbutton(parent, variable=self.use),
-                 ttk.Label(parent, text=f"{self.index + 1}. {self.level}"),
-                 ttk.Entry(parent, textvariable=self.title, width=36),
-                 ttk.Entry(parent, textvariable=self.doc, width=36),
-                 ttk.Label(parent, textvariable=self.scale, style="Hint.TLabel", width=7),
-                 ttk.Button(parent, text="Preview", style="Small.TButton", command=lambda: self.app.preview(self.index))]
-            for c, x in enumerate(w):
-                x.grid(row=r, column=c, sticky="w" if c in (0, 1, 4) else "ew", padx=4, pady=2)
-            self.widgets = w
 
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
             apply_theme(self)
             self.title(APP_TITLE)
-            self.geometry("1180x860")
-            self.minsize(1000, 700)
+            self.geometry("1100x820")
+            self.minsize(940, 660)
             self.settings = load_settings()
-            self.template_path = self.settings.get("template") or str(default_template())
-            if not Path(self.template_path).exists():
-                self.template_path = str(default_template())
+            self.template_path = str(default_template())
             self.h2x_path = ""
-            self.rows: list[SheetRow] = []
-            self.rev_count = 7
+            self.pages = []
             self.busy = False
             self._setting_doc = False
             self._check_after = None
             self._check_id = 0
             self._pending = []
-            self.tdefaults = {"defaults": {}, "rev_rows": []}
+            self.tdefaults = {"defaults": {}, "rev_rows": [], "rev_count": 7}
             ctx = multiprocessing.get_context("spawn")
             self.pool = ProcessPoolExecutor(1, mp_context=ctx)
             self.pool.submit(worker.warm)
             self.vars = {k: tk.StringVar() for k in ("project", "status", "drawn", "date")}
-            self.crop = tk.StringVar(value=CROP_MODES[0][1])
-            self.scale_mode = tk.StringVar(value=SCALE_MODES[0][1])
-            self.same_layout = tk.BooleanVar(value=True)
-            self.auto_number = tk.BooleanVar(value=True)
-            self.combined = tk.BooleanVar(value=bool(self.settings.get("combined", True)))
+            self.page = tk.StringVar()
+            self.titles = {v: tk.StringVar(value=f"Heat Loss Layout - {name}") for v, name in VIEWS}
+            self.docs = {v: tk.StringVar() for v, _ in VIEWS}
+            self.scales = {v: tk.StringVar() for v, _ in VIEWS}
             self.out_dir = tk.StringVar(value=self.settings.get("output_dir", ""))
             self.status_text = tk.StringVar(value="Choose an H2X PDF to start.")
             self.check_text = tk.StringVar(value="")
             self.h2x_text = tk.StringVar(value="No H2X PDF chosen")
-            self.tpl_text = tk.StringVar()
             self._build()
-            self._update_template_label()
             self._load_template_defaults()
-            for v in list(self.vars.values()) + [self.crop, self.scale_mode, self.same_layout]:
+            for v in list(self.vars.values()) + list(self.titles.values()) + [self.page]:
+                v.trace_add("write", lambda *_: self.changed())
+            self.docs[VIEWS[0][0]].trace_add("write", lambda *_: self.renumber())
+            for v in self.docs.values():
                 v.trace_add("write", lambda *_: self.changed())
             self.protocol("WM_DELETE_WINDOW", self.destroy)
             self.after(100, self._drain)
@@ -269,8 +235,8 @@ def run_gui(preload=None, _mainloop=True):
             banner = ttk.Frame(self, style="Banner.TFrame", padding=(16, 10))
             banner.pack(fill="x")
             ttk.Label(banner, text=APP_TITLE, style="Banner.TLabel").pack(side="left")
-            ttk.Label(banner, text="H2X heat loss sheets → Synergi A3 drawing template. The H2X drawing is "
-                                   "placed exactly as exported, only scaled.", style="BannerSub.TLabel").pack(side="left", padx=14)
+            ttk.Label(banner, text="H2X export → three Synergi A3 sheets. The H2X drawing is placed exactly "
+                                   "as exported, only scaled.", style="BannerSub.TLabel").pack(side="left", padx=14)
 
             outer = ttk.Frame(self, style="Page.TFrame")
             outer.pack(fill="both", expand=True)
@@ -289,44 +255,34 @@ def run_gui(preload=None, _mainloop=True):
                     return
                 canvas.yview_scroll(int(-e.delta / 120) if e.delta else 0, "units")
             self.bind_all("<MouseWheel>", wheel)
-            self.canvas = canvas
 
-            # 1 files
+            # 1 H2X export
             c, b = card(body, "1", "H2X export")
             c.pack(fill="x", pady=(0, 8))
             b.columnconfigure(1, weight=1)
             ttk.Label(b, text="H2X PDF", style="Field.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(b, textvariable=self.h2x_text).grid(row=0, column=1, sticky="w", padx=8)
             ttk.Button(b, text="Choose H2X PDF…", command=self.pick_h2x).grid(row=0, column=2, sticky="e")
-            ttk.Label(b, text="Template", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
-            ttk.Label(b, textvariable=self.tpl_text, style="Hint.TLabel").grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
-            tb = ttk.Frame(b)
-            tb.grid(row=1, column=2, sticky="e", pady=(6, 0))
-            ttk.Button(tb, text="Built-in", style="Small.TButton", command=self.reset_template).pack(side="right", padx=(4, 0))
-            ttk.Button(tb, text="Other template…", style="Small.TButton", command=self.pick_template).pack(side="right")
+            self.page_label = ttk.Label(b, text="H2X page", style="Field.TLabel")
+            self.page_box = ttk.Combobox(b, textvariable=self.page, state="readonly", width=40)
 
             # 2 sheets
-            c, b = card(body, "2", "Sheets", "one Synergi sheet per H2X page")
+            c, b = card(body, "2", "Sheets", "document numbers count up from the first")
             c.pack(fill="x", pady=(0, 8))
-            self.sheet_frame = b
-            opts = ttk.Frame(b)
-            opts.pack(fill="x")
-            ttk.Label(opts, text="Show", style="Field.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Combobox(opts, textvariable=self.crop, values=[m[1] for m in CROP_MODES], state="readonly",
-                         width=44).grid(row=0, column=1, sticky="w", padx=6)
-            ttk.Label(opts, text="Scale", style="Field.TLabel").grid(row=0, column=2, sticky="w", padx=(12, 0))
-            ttk.Combobox(opts, textvariable=self.scale_mode, values=[m[1] for m in SCALE_MODES], state="readonly",
-                         width=28).grid(row=0, column=3, sticky="w", padx=6)
-            ttk.Checkbutton(opts, text="Same scale and position on every sheet (plans line up between levels)",
-                            variable=self.same_layout).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-            ttk.Checkbutton(opts, text="Number documents up from row 1", variable=self.auto_number,
-                            command=self.renumber).grid(row=2, column=0, columnspan=4, sticky="w")
-            self.table = ttk.Frame(b)
-            self.table.pack(fill="x", pady=(8, 0))
-            self._table_head()
+            for i, h in enumerate(["Sheet", "Drawing title", "Document number", "Scale", ""]):
+                ttk.Label(b, text=h, style="Head.TLabel").grid(row=0, column=i, sticky="ew", padx=1)
+            b.columnconfigure(1, weight=1)
+            b.columnconfigure(2, weight=1)
+            for r, (v, name) in enumerate(VIEWS, start=1):
+                ttk.Label(b, text=name).grid(row=r, column=0, sticky="w", padx=4, pady=2)
+                ttk.Entry(b, textvariable=self.titles[v], width=36).grid(row=r, column=1, sticky="ew", padx=4, pady=2)
+                ttk.Entry(b, textvariable=self.docs[v], width=36).grid(row=r, column=2, sticky="ew", padx=4, pady=2)
+                ttk.Label(b, textvariable=self.scales[v], style="Hint.TLabel", width=6).grid(row=r, column=3, padx=4)
+                ttk.Button(b, text="Preview", style="Small.TButton",
+                           command=lambda v=v: self.preview(v)).grid(row=r, column=4, padx=4, pady=2)
 
             # 3 title block
-            c, b = card(body, "3", "Title block", "the same on every sheet")
+            c, b = card(body, "3", "Title block", "the same on all three sheets")
             c.pack(fill="x", pady=(0, 8))
             for col in (1, 3):
                 b.columnconfigure(col, weight=1)
@@ -347,14 +303,13 @@ def run_gui(preload=None, _mainloop=True):
             ttk.Entry(df, textvariable=self.vars["date"], width=14).pack(side="left")
             ttk.Button(df, text="Today", style="Small.TButton",
                        command=lambda: self.vars["date"].set(today())).pack(side="left", padx=6)
-            ttk.Label(df, text="YYYY-MM-DD", style="Hint.TLabel").pack(side="left")
             ttk.Label(b, text="Revision", style="Field.TLabel").grid(row=3, column=2, sticky="w", padx=(12, 0))
             self.rev_label = ttk.Label(b, text="", style="Hint.TLabel")
             self.rev_label.grid(row=3, column=3, sticky="w", padx=6)
 
             # 4 revisions & notes
             c, b = card(body, "4", "Revision table & notes",
-                        "row 1 is the bottom row of the table (first issue); the newest filled row is the sheet revision")
+                        "row 1 is the bottom row (first issue); the newest filled row is the sheet revision")
             c.pack(fill="x", pady=(0, 8))
             rt = ttk.Frame(b)
             rt.pack(side="left", anchor="n")
@@ -363,7 +318,7 @@ def run_gui(preload=None, _mainloop=True):
             for i, h in enumerate(heads):
                 ttk.Label(rt, text=h, style="Head.TLabel").grid(row=0, column=i, sticky="ew", padx=1)
             self.rev_vars = []
-            for r in range(self.rev_count):
+            for r in range(7):
                 row = {}
                 ttk.Label(rt, text=str(r + 1), style="Hint.TLabel").grid(row=r + 1, column=0)
                 for i, k in enumerate(REV_KEYS):
@@ -380,34 +335,22 @@ def run_gui(preload=None, _mainloop=True):
             self.notes.pack(fill="both", expand=True, pady=(4, 0))
             self.notes.bind("<<Modified>>", self._text_modified)
 
-            # 5 output
+            # 5 save
             c, b = card(body, "5", "Save")
             c.pack(fill="x", pady=(0, 8))
             b.columnconfigure(1, weight=1)
             ttk.Label(b, text="Output folder", style="Field.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Entry(b, textvariable=self.out_dir).grid(row=0, column=1, sticky="ew", padx=6)
             ttk.Button(b, text="Choose…", command=self.pick_output).grid(row=0, column=2)
-            ttk.Checkbutton(b, text="Also save all sheets together in one PDF", variable=self.combined).grid(
-                row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
             self.check_label = ttk.Label(b, textvariable=self.check_text, style="Hint.TLabel", wraplength=900,
                                          justify="left")
-            self.check_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            self.check_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
             foot = ttk.Frame(self, padding=(14, 8))
             foot.pack(fill="x", side="bottom")
             ttk.Label(foot, textvariable=self.status_text, style="Hint.TLabel").pack(side="left")
-            self.gen_btn = ttk.Button(foot, text="Generate drawings", style="Accent.TButton", command=self.generate)
+            self.gen_btn = ttk.Button(foot, text="Generate 3 sheets", style="Accent.TButton", command=self.generate)
             self.gen_btn.pack(side="right")
-            self.prev_btn = ttk.Button(foot, text="Preview first sheet", command=lambda: self.preview(None))
-            self.prev_btn.pack(side="right", padx=8)
-
-        def _table_head(self):
-            for w in self.table.winfo_children():
-                w.destroy()
-            for i, h in enumerate(["Use", "H2X page", "Drawing title", "Document number", "Scale", ""]):
-                ttk.Label(self.table, text=h, style="Head.TLabel").grid(row=0, column=i, sticky="ew", padx=1)
-            self.table.columnconfigure(2, weight=1)
-            self.table.columnconfigure(3, weight=1)
 
         # ------------------------------------------------------------ worker plumbing
         def _submit(self, fn, *args, done=None):
@@ -444,11 +387,7 @@ def run_gui(preload=None, _mainloop=True):
         def _remember(self):
             d = dict(self.settings)
             d.update(drawn=self.vars["drawn"].get(), status=self.vars["status"].get(),
-                     output_dir=self.out_dir.get(), combined=bool(self.combined.get()))
-            if self.template_path != str(default_template()):
-                d["template"] = self.template_path
-            else:
-                d.pop("template", None)
+                     output_dir=self.out_dir.get())
             chk = [r["chk"].get() for r in self.rev_vars if r["chk"].get()]
             if chk:
                 d["chk"] = chk[-1]
@@ -456,38 +395,16 @@ def run_gui(preload=None, _mainloop=True):
 
         def _set_busy(self, busy, text=""):
             self.busy = busy
-            state = "disabled" if busy else "normal"
-            self.gen_btn.configure(state=state)
-            self.prev_btn.configure(state=state)
+            self.gen_btn.configure(state="disabled" if busy else "normal")
             if text:
                 self.status_text.set(text)
             self.configure(cursor="watch" if busy else "")
 
         # ------------------------------------------------------------ files
-        def _update_template_label(self):
-            if self.template_path == str(default_template()):
-                self.tpl_text.set("Synergi A3 drawing template (built in)")
-            else:
-                self.tpl_text.set(self.template_path)
-
-        def pick_template(self):
-            p = filedialog.askopenfilename(title="Choose the Synergi drawing template PDF",
-                                           filetypes=[("PDF", "*.pdf")])
-            if p:
-                self.template_path = p
-                self._update_template_label()
-                self._load_template_defaults(reload_h2x=True)
-
-        def reset_template(self):
-            self.template_path = str(default_template())
-            self._update_template_label()
-            self._load_template_defaults(reload_h2x=True)
-
-        def _load_template_defaults(self, reload_h2x=False):
+        def _load_template_defaults(self):
             def done(res, err):
                 if err:
-                    messagebox.showerror(APP_TITLE, f"This template cannot be used:\n\n{err}")
-                    self.reset_template() if self.template_path != str(default_template()) else None
+                    messagebox.showerror(APP_TITLE, f"The built-in template could not be read:\n\n{err}")
                     return
                 self.tdefaults = res
                 d = res["defaults"]
@@ -497,19 +414,13 @@ def run_gui(preload=None, _mainloop=True):
                 self.vars["date"].set(today())
                 if not self.vars["project"].get():
                     self.vars["project"].set(d.get("project", ""))
-                rows = res["rev_rows"]
-                first = rows[0] if rows else {}
-                for r, row in enumerate(self.rev_vars):
-                    for k in REV_KEYS:
-                        row[k].set("")
-                if first:
-                    self.rev_vars[0]["rev"].set(first.get("rev") or "P01")
-                    self.rev_vars[0]["date"].set(today())
-                    self.rev_vars[0]["description"].set(first.get("description") or "Initial Issue")
-                    self.rev_vars[0]["drn"].set(self._initials(self.vars["drawn"].get()) or first.get("drn", ""))
-                    self.rev_vars[0]["chk"].set(s.get("chk") or first.get("chk", ""))
-                if reload_h2x and self.h2x_path:
-                    self.load_h2x(self.h2x_path)
+                first = (res["rev_rows"] or [{}])[0]
+                self.rev_vars[0]["rev"].set(first.get("rev") or "P01")
+                self.rev_vars[0]["date"].set(today())
+                self.rev_vars[0]["description"].set(first.get("description") or "Initial Issue")
+                self.rev_vars[0]["drn"].set(self._initials(self.vars["drawn"].get()) or first.get("drn", ""))
+                self.rev_vars[0]["chk"].set(s.get("chk") or first.get("chk", ""))
+                self.docs[VIEWS[0][0]].set(d.get("document_number", ""))
                 self.changed()
             self._submit(worker.template_info, self.template_path, done=done)
 
@@ -523,7 +434,15 @@ def run_gui(preload=None, _mainloop=True):
             if p:
                 self.load_h2x(p)
 
-        def load_h2x(self, p, then=None):
+        def _page_names(self):
+            return [f"Page {p['index'] + 1}" + (f" - {p['level'].title()}" if p["level"] else "")
+                    + ("" if not p["split_error"] else "  (no isometric)") for p in self.pages]
+
+        def page_index(self) -> int:
+            names = self._page_names()
+            return names.index(self.page.get()) if self.page.get() in names else 0
+
+        def load_h2x(self, p):
             self._set_busy(True, "Reading the H2X PDF…")
 
             def done(res, err):
@@ -533,32 +452,27 @@ def run_gui(preload=None, _mainloop=True):
                     messagebox.showerror(APP_TITLE, f"Could not read the H2X PDF:\n\n{err}")
                     return
                 self.h2x_path = p
-                sh = res["sheets"]
+                self.pages = res["pages"]
                 self.h2x_text.set(Path(p).name)
-                sc = sh[0]["scale"] if sh else None
-                levels = ", ".join(s["level"] or f"page {s['index'] + 1}" for s in sh)
-                self.status_text.set(f"{len(sh)} sheet{'s' if len(sh) != 1 else ''} found: {levels}"
-                                     + (f"  ·  H2X scale 1:{sc}" + (f" @ {sh[0]['paper']}" if sh[0]['paper'] else "") if sc else ""))
-                proj = next((s["project"] for s in sh if s["project"]), "")
+                names = self._page_names()
+                self.page_box.configure(values=names)
+                self.page.set(names[best_page(self.pages)])
+                if len(self.pages) > 1:
+                    self.page_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+                    self.page_box.grid(row=1, column=1, sticky="w", padx=8, pady=(6, 0))
+                else:
+                    self.page_label.grid_remove()
+                    self.page_box.grid_remove()
+                pg = self.pages[best_page(self.pages)]
+                self.status_text.set("H2X PDF loaded" + (f"  ·  H2X scale 1:{pg['scale']}"
+                                                         + (f" @ {pg['paper']}" if pg["paper"] else "") if pg["scale"] else ""))
+                proj = next((s["project"] for s in self.pages if s["project"]), "")
                 cur = self.vars["project"].get()
                 if proj and (not cur or cur == self.tdefaults["defaults"].get("project")):
                     self.vars["project"].set(f"SES-P-XXX {self._title(proj)}")
                 if not self.out_dir.get():
                     self.out_dir.set(str(Path(p).parent))
-                self._table_head()
-                self.rows = []
-                for r, s in enumerate(sh):
-                    row = SheetRow(self, s)
-                    row.grid(self.table, r + 1)
-                    self.rows.append(row)
-                self._setting_doc = True
-                if self.rows:
-                    self.rows[0].doc.set(self.tdefaults["defaults"].get("document_number", ""))
-                self._setting_doc = False
-                self.renumber()
                 self.changed()
-                if then:
-                    then()
             self._submit(worker.analyse, p, self.template_path, done=done)
 
         @staticmethod
@@ -572,17 +486,12 @@ def run_gui(preload=None, _mainloop=True):
 
         # ------------------------------------------------------------ values
         def renumber(self):
-            if not self.auto_number.get() or not self.rows:
+            if self._setting_doc:
                 return
-            first = self.rows[0].doc.get()
+            first = self.docs[VIEWS[0][0]].get()
             self._setting_doc = True
-            k = 0
-            for row in self.rows:
-                if not row.use.get():
-                    continue
-                if row is not self.rows[0]:
-                    row.doc.set(bump_number(first, k))
-                k += 1
+            for k, (v, _) in enumerate(VIEWS[1:], start=1):
+                self.docs[v].set(bump_number(first, k))
             self._setting_doc = False
 
         def _text_modified(self, e):
@@ -597,16 +506,13 @@ def run_gui(preload=None, _mainloop=True):
             return filled[-1]["rev"] if filled else ""
 
         def job(self) -> Job:
-            crop = next(k for k, t in CROP_MODES if t == self.crop.get())
-            scale = next(k for k, t in SCALE_MODES if t == self.scale_mode.get())
-            rows = [r for r in self.rows if r.use.get()]
-            sheets = [SheetSpec(r.index, r.title.get().strip(), r.doc.get().strip()) for r in rows]
+            page = self.page_index()
+            sheets = [SheetSpec(v, self.titles[v].get().strip(), self.docs[v].get().strip(), page) for v, _ in VIEWS]
             shared = {k: v.get().strip() for k, v in self.vars.items()}
             shared["client"] = self.client.get("1.0", "end").strip()
             shared["rev"] = self.latest_rev()
             return Job(self.template_path, self.h2x_path, sheets, shared, self.revisions(),
-                       self.notes.get("1.0", "end").strip(), crop, scale, bool(self.same_layout.get()),
-                       self.out_dir.get().strip(), bool(self.combined.get()))
+                       self.notes.get("1.0", "end").strip(), self.out_dir.get().strip())
 
         def changed(self):
             self.rev_label.configure(text=(self.latest_rev() or "—") + "   (from the revision table)")
@@ -616,7 +522,7 @@ def run_gui(preload=None, _mainloop=True):
 
         def _run_check(self):
             self._check_after = None
-            if not self.h2x_path or not any(r.use.get() for r in self.rows):
+            if not self.h2x_path:
                 return
             self._check_id += 1
             cid = self._check_id
@@ -628,8 +534,8 @@ def run_gui(preload=None, _mainloop=True):
                     self.check_text.set(str(err))
                     self.check_label.configure(style="Error.TLabel")
                     return
-                for row in self.rows:
-                    row.scale.set(res["scales"].get(row.index, ""))
+                for v, _ in VIEWS:
+                    self.scales[v].set(res["scales"].get(v, ""))
                 if res["errors"]:
                     self.check_text.set("Fix before generating:\n" + "\n".join(f"• {m}" for m in res["errors"].values()))
                     self.check_label.configure(style="Error.TLabel")
@@ -643,20 +549,16 @@ def run_gui(preload=None, _mainloop=True):
             if not self.h2x_path:
                 messagebox.showinfo(APP_TITLE, "Choose an H2X PDF first.")
                 return False
-            if not any(r.use.get() for r in self.rows):
-                messagebox.showinfo(APP_TITLE, "Tick at least one sheet.")
-                return False
             if need_output and not self.out_dir.get().strip():
                 messagebox.showinfo(APP_TITLE, "Choose an output folder.")
                 return False
             return True
 
-        def preview(self, index):
+        def preview(self, view):
             if self.busy or not self._ready(False):
                 return
-            if index is None:
-                index = next(r.index for r in self.rows if r.use.get())
-            self._set_busy(True, f"Building a preview of sheet {index + 1}…")
+            name = dict(VIEWS)[view]
+            self._set_busy(True, f"Building a preview of the {name} sheet…")
 
             def done(res, err):
                 self._set_busy(False, "")
@@ -664,18 +566,14 @@ def run_gui(preload=None, _mainloop=True):
                     self.status_text.set("Preview failed.")
                     messagebox.showerror(APP_TITLE, str(err or res["error"]))
                     return
-                self.status_text.set(f"Preview of sheet {index + 1} ready.")
-                self._show_preview(res, index)
-            job = self.job()
-            if index not in [s.index for s in job.sheets]:
-                row = next(r for r in self.rows if r.index == index)
-                job.sheets.append(SheetSpec(index, row.title.get().strip(), row.doc.get().strip()))
-            self._submit(worker.preview, job, index, done=done)
+                self.status_text.set(f"Preview of the {name} sheet ready.")
+                self._show_preview(res, name)
+            self._submit(worker.preview, self.job(), view, done=done)
 
-        def _show_preview(self, res, index):
+        def _show_preview(self, res, name):
             from PIL import Image, ImageTk
             top = tk.Toplevel(self)
-            top.title(f"Preview - sheet {index + 1}")
+            top.title(f"Preview - {name}")
             top.configure(background=PAGE)
             im = Image.open(res["png"])
             sw, sh = self.winfo_screenwidth() * 0.9, self.winfo_screenheight() * 0.85
@@ -698,13 +596,13 @@ def run_gui(preload=None, _mainloop=True):
             job = self.job()
             from h2x_template.compose import filename
             out = Path(job.output_dir)
-            clash = [filename(s, job.shared.get("rev", "")) for s in job.sheets
-                     if (out / filename(s, job.shared.get("rev", ""))).exists()]
+            rev = job.shared.get("rev", "")
+            clash = [filename(s, rev) for s in job.sheets if (out / filename(s, rev)).exists()]
             if clash and not messagebox.askyesno(APP_TITLE, "These files already exist and will be replaced:\n\n"
-                                                 + "\n".join(clash[:10]) + "\n\nContinue?"):
+                                                 + "\n".join(clash) + "\n\nContinue?"):
                 return
             self._remember()
-            self._set_busy(True, f"Generating {len(job.sheets)} sheet(s) and checking each one…")
+            self._set_busy(True, "Generating 3 sheets and checking each one…")
 
             def done(res, err):
                 self._set_busy(False, "")
@@ -718,15 +616,11 @@ def run_gui(preload=None, _mainloop=True):
                     "✓ " + Path(r["path"]).name for r in ok)
                 if bad:
                     msg += "\n\nFailed:\n" + "\n\n".join(f"✗ {r['title']}: {r['error']}" for r in bad)
-                notes = [n for r in ok for n in r.get("notes", [])]
-                if notes:
-                    msg += "\n\nPlease check: " + "; ".join(sorted(set(notes)))
                 self.status_text.set(f"Saved {len(ok)} file(s)." + (f" {len(bad)} failed." if bad else ""))
                 if bad:
                     messagebox.showwarning(APP_TITLE, msg)
-                else:
-                    if messagebox.askyesno(APP_TITLE, msg + "\n\nOpen the folder?"):
-                        open_path(job.output_dir)
+                elif messagebox.askyesno(APP_TITLE, msg + "\n\nOpen the folder?"):
+                    open_path(job.output_dir)
             self._submit(worker.generate, job, done=done)
 
     app = App()

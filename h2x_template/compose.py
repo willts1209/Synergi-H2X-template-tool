@@ -41,30 +41,32 @@ class Placement:
         return (x0 * s + tx, y0 * s + ty, x1 * s + tx, y1 * s + ty)
 
 
+VIEWS = [("combined", "Plan & Isometric"), ("plan", "Plan"), ("iso", "Isometric")]
+VIEW_NAMES = dict(VIEWS)
+
+
 @dataclass
 class SheetSpec:
-    index: int                      # H2X page index
+    view: str                       # combined | plan | iso
     title: str
     document_number: str
+    index: int = 0                  # H2X page index
 
 
 @dataclass
 class Job:
     template: str
     h2x: str
-    sheets: list                    # [SheetSpec]
-    shared: dict                    # project, client, status, drawn, date, rev, size, scale (optional override)
+    sheets: list                    # [SheetSpec], normally one per view
+    shared: dict                    # project, client, status, drawn, date, rev
     revisions: list = field(default_factory=list)
     notes: str = ""
-    crop_mode: str = "content"      # content | frame | page
-    scale_mode: str = "standard"    # standard | fit
-    same_layout: bool = True        # one crop + scale for every sheet so plans line up between levels
     output_dir: str = "."
-    combined: bool = False
 
 
-def _union(boxes):
-    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+def default_sheets(first_number: str, page: int = 0, base_title: str = "Heat Loss Layout") -> list:
+    return [SheetSpec(v, f"{base_title} - {name}", tpl.bump_number(first_number, k), page)
+            for k, (v, name) in enumerate(VIEWS)]
 
 
 def drawing_area(info: tpl.TemplateInfo, margin=MARGIN):
@@ -72,43 +74,25 @@ def drawing_area(info: tpl.TemplateInfo, margin=MARGIN):
     return (x0 + margin, y0 + margin, x1 - margin, y1 - margin)
 
 
-def plan(info: tpl.TemplateInfo, sheets: list, indices: list, crop_mode="content", scale_mode="standard",
-         same_layout=True) -> dict:
-    """{sheet index: Placement}."""
-    by = {s.index: s for s in sheets}
-    sel = [by[i] for i in indices]
-    if not sel:
-        return {}
+def place(info: tpl.TemplateInfo, sheet, view: str) -> Placement:
+    """Largest standard scale that fits (isometric: fit to sheet, NTS), centred in the drawing area."""
     ax0, ay0, ax1, ay1 = drawing_area(info)
     aw, ah = ax1 - ax0, ay1 - ay0
-    crops = {s.index: s.crop(crop_mode) for s in sel}
-    if same_layout:
-        u = _union(list(crops.values()))
-        crops = {k: u for k in crops}
-    fits = {k: min(aw / (c[2] - c[0]), ah / (c[3] - c[1])) for k, c in crops.items()}
-    out = {}
-    common = min(fits.values())
-    for s in sel:
-        crop = crops[s.index]
-        fit = common if same_layout else fits[s.index]
-        src = s.scale_denominator
-        if scale_mode == "standard" and src:
-            need = src / fit
-            denom = next((d for d in STANDARD_SCALES if d >= need - 1e-9), None)
-            if denom is None:
-                denom = int(need) + 1
-            scale = src / denom
-            text = f"1:{denom}"
-        else:
-            scale, denom = fit, None
-            text = "NTS"
-        cw, ch = (crop[2] - crop[0]) * scale, (crop[3] - crop[1]) * scale
-        tx = ax0 + (aw - cw) / 2 - crop[0] * scale
-        ty = ay0 + (ah - ch) / 2 - crop[1] * scale
-        out[s.index] = Placement(tuple(float(v) for v in crop),
-                                 (round(scale, 6), 0.0, 0.0, round(scale, 6), round(tx, 4), round(ty, 4)),
-                                 scale, denom, text)
-    return out
+    crop = sheet.crop(view)
+    fit = min(aw / (crop[2] - crop[0]), ah / (crop[3] - crop[1]))
+    src = sheet.scale_denominator
+    if view != "iso" and src:
+        need = src / fit
+        denom = next((d for d in STANDARD_SCALES if d >= need - 1e-9), None) or int(need) + 1
+        scale, text = src / denom, f"1:{denom}"
+    else:
+        scale, denom, text = fit, None, "NTS"
+    cw, ch = (crop[2] - crop[0]) * scale, (crop[3] - crop[1]) * scale
+    tx = ax0 + (aw - cw) / 2 - crop[0] * scale
+    ty = ay0 + (ah - ch) / 2 - crop[1] * scale
+    return Placement(tuple(float(v) for v in crop),
+                     (round(scale, 6), 0.0, 0.0, round(scale, 6), round(tx, 4), round(ty, 4)),
+                     scale, denom, text)
 
 
 def source_content(page) -> bytes:
@@ -154,9 +138,8 @@ def sheet_values(job: Job, spec: SheetSpec, placement: Placement, info: tpl.Temp
     v = {k: job.shared.get(k, "") for k in ("project", "client", "status", "drawn", "date", "rev")}
     v["title"] = spec.title
     v["document_number"] = spec.document_number
-    v["size"] = job.shared.get("size") or info.size_name or info.fields["size"].value.text
-    sc = job.shared.get("scale") or ""
-    v["scale"] = sc if sc and sc.lower() != "auto" else placement.scale_text
+    v["size"] = info.size_name or info.fields["size"].value.text
+    v["scale"] = placement.scale_text
     return v
 
 
@@ -170,24 +153,30 @@ class Result:
 
 
 def preflight(job: Job, info=None, sheets=None) -> tuple[dict, dict]:
-    """Check every value fits before anything is written.  Returns (errors, placements)."""
+    """Check every value fits before anything is written.  Returns (errors, {view: Placement})."""
     info = info or tpl.analyse(job.template)
     sheets = sheets or h2xmod.analyse(job.h2x)
-    n = len(sheets)
-    errs = {}
+    errs, places = {}, {}
     for spec in job.sheets:
-        if not 0 <= spec.index < n:
-            errs[f"sheet{spec.index}"] = f"The H2X PDF has no page {spec.index + 1}."
+        if not 0 <= spec.index < len(sheets):
+            errs[f"page{spec.index}"] = f"The H2X PDF has no page {spec.index + 1}."
+            continue
+        try:
+            places[spec.view] = place(info, sheets[spec.index], spec.view)
+        except h2xmod.H2XError as exc:
+            errs[f"view-{spec.view}"] = str(exc)
     if errs:
-        return errs, {}
-    places = plan(info, sheets, [s.index for s in job.sheets], job.crop_mode, job.scale_mode, job.same_layout)
+        return errs, places
     ed = tpl.Editor(info)
     try:
         for spec in job.sheets:
-            vals = sheet_values(job, spec, places[spec.index], info)
+            vals = sheet_values(job, spec, places[spec.view], info)
+            name = VIEW_NAMES.get(spec.view, spec.view)
             for k, msg in ed.check(vals, job.revisions, job.notes).items():
-                key = k if k not in ("title", "document_number") else f"{k}{spec.index}"
-                errs[key] = msg if k not in ("title", "document_number") else f"Sheet {spec.index + 1}: {msg}"
+                if k in ("title", "document_number"):
+                    errs[f"{k}-{spec.view}"] = f"{name} sheet: {msg}"
+                else:
+                    errs[k] = msg
     finally:
         ed.pdf.close()
     return errs, places
@@ -223,31 +212,6 @@ def build_sheet(job: Job, spec: SheetSpec, info, sheet, placement, out_path: Pat
     return report
 
 
-def combine(paths: list, out: Path):
-    """One PDF holding every sheet (layers kept)."""
-    pdf = pikepdf.new()
-    opened = []
-    try:
-        for p in paths:
-            src = pikepdf.open(p)
-            opened.append(src)
-            if len(opened) == 1 and "/OCProperties" in src.Root:
-                pdf.Root.OCProperties = pdf.copy_foreign(src.make_indirect(src.Root.OCProperties))
-            pdf.pages.extend(src.pages)
-        if "/OCProperties" in pdf.Root:
-            ocgs = pdf.Root.OCProperties.OCGs
-            known = {o.objgen for o in ocgs}
-            for page in pdf.pages:
-                for _, o in page.Resources.get("/Properties", {}).items():
-                    if o.get("/Type") == "/OCG" and o.objgen not in known:
-                        ocgs.append(o)
-                        known.add(o.objgen)
-        pdf.save(out)
-    finally:
-        for s in opened:
-            s.close()
-
-
 def run(job: Job, progress=None) -> list[Result]:
     info = tpl.analyse(job.template)
     sheets = h2xmod.analyse(job.h2x)
@@ -256,7 +220,6 @@ def run(job: Job, progress=None) -> list[Result]:
         raise ComposeError("Please fix these first:\n" + "\n".join(f"• {m}" for m in errs.values()))
     out_dir = Path(job.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    by = {s.index: s for s in sheets}
     results = []
     rev = job.shared.get("rev", "")
     for n, spec in enumerate(job.sheets):
@@ -264,16 +227,8 @@ def run(job: Job, progress=None) -> list[Result]:
             progress(n, len(job.sheets), spec)
         path = out_dir / filename(spec, rev)
         try:
-            rep = build_sheet(job, spec, info, by[spec.index], places[spec.index], path)
+            rep = build_sheet(job, spec, info, sheets[spec.index], places[spec.view], path)
             results.append(Result(spec, path, True, "", rep))
         except Exception as exc:  # noqa: BLE001 - reported per sheet
-            rep = getattr(exc, "report", None)
-            results.append(Result(spec, None, False, str(exc), rep))
-    if job.combined:
-        good = [r.path for r in results if r.ok]
-        if len(good) > 1:
-            first = job.sheets[0]
-            name = safe_name(f"{first.document_number}_{rev} - All sheets ({len(good)})") + ".pdf"
-            combine(good, out_dir / name)
-            results.append(Result(SheetSpec(-1, "All sheets", ""), out_dir / name, True))
+            results.append(Result(spec, None, False, str(exc), getattr(exc, "report", None)))
     return results

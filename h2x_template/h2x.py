@@ -28,18 +28,17 @@ class Sheet:
     scale_denominator: int | None = None   # 100 for '1:100 @ A1'
     paper: str = ""
     info: dict = field(default_factory=dict)
+    plan: tuple | None = None    # box around the floor plan(s) and their figures
+    iso: tuple | None = None     # box around the isometric view
+    split_error: str = ""        # why plan / isometric could not be separated
 
-    def crop(self, mode: str) -> tuple:
-        if mode == "page":
-            return (0.0, 0.0, self.width, self.height)
-        if mode == "frame":
-            return self.frame
-        return self.content
-
-    @property
-    def default_title(self) -> str:
-        lvl = _title_case(self.level) if self.level else f"Sheet {self.index + 1}"
-        return f"{lvl} - Heat Loss Layout"
+    def crop(self, view: str) -> tuple:
+        """Region of the H2X page shown on a sheet: 'combined', 'plan' or 'iso'."""
+        if view == "combined":
+            return self.content
+        if self.split_error:
+            raise H2XError(self.split_error)
+        return self.plan if view == "plan" else self.iso
 
 
 def _title_case(s: str) -> str:
@@ -65,25 +64,67 @@ def _lines(words):
     return out
 
 
-def _content_box(path, index, frame, page_h, dpi=50) -> tuple:
-    """Tight box around what is drawn inside the frame (rendered, so it catches everything)."""
+def _ink(img, frame, page_h, dpi, exclude=()):
+    """Ink mask inside the frame (rendered, so it catches everything), plus its pixel origin."""
     x0, y0, x1, y1 = frame
     inset = 3.0
-    img = render(Path(path), index, dpi)
     s = dpi / 72.0
     c0, c1 = int((x0 + inset) * s), int((x1 - inset) * s)
     r0, r1 = int((page_h - y1 + inset) * s), int((page_h - y0 - inset) * s)
     sub = img[r0:r1, c0:c1]
     ink = (sub.min(axis=2) < 245) if sub.ndim == 3 else (sub < 245)
+    for ex0, ey0, ex1, ey1 in exclude:
+        a0, a1 = max(0, int(ex0 * s) - c0), max(0, int(np.ceil(ex1 * s)) - c0 + 1)
+        b0, b1 = max(0, int((page_h - ey1) * s) - r0), max(0, int(np.ceil((page_h - ey0) * s)) - r0 + 1)
+        ink[b0:b1, a0:a1] = False
+    return ink, c0, r0
+
+
+def _box(ink, c0, r0, frame, page_h, dpi, pad=6.0):
+    s = dpi / 72.0
     ys, xs = np.nonzero(ink)
     if len(xs) == 0:
-        return frame
-    pad = 6.0
+        return None
+    x0, y0, x1, y1 = frame
     bx0 = (c0 + xs.min()) / s - pad
     bx1 = (c0 + xs.max() + 1) / s + pad
     by1 = page_h - ((r0 + ys.min()) / s - pad)
     by0 = page_h - ((r0 + ys.max() + 1) / s + pad)
     return (max(x0, bx0), max(y0, by0), min(x1, bx1), min(y1, by1))
+
+
+def _overlap(a, b) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _split(sheet: Sheet, img, images, page_h, dpi):
+    """Find the isometric (H2X exports it as one embedded image) and the plan (everything else)."""
+    fx0, fy0, fx1, fy1 = sheet.frame
+    inside = [im for im in images if im[0] >= fx0 - 1 and im[2] <= fx1 + 1 and im[1] >= fy0 - 1 and im[3] <= fy1 + 1]
+    big = [im for im in inside if (im[2] - im[0]) * (im[3] - im[1]) > 0.01 * (fx1 - fx0) * (fy1 - fy0)]
+    if not big:
+        sheet.split_error = ("No isometric view found on this H2X page, so the plan-only and isometric-only "
+                             "sheets can't be made. Export from H2X with the 3D view included.")
+        return
+    iso = max(big, key=lambda im: (im[2] - im[0]) * (im[3] - im[1]))
+    gap = 2.0
+    iso_box = (max(fx0, iso[0] - gap), max(fy0, iso[1] - gap), min(fx1, iso[2] + gap), min(fy1, iso[3] + gap))
+    ink, c0, r0 = _ink(img, sheet.frame, page_h, dpi, exclude=[iso_box])
+    plan = _box(ink, c0, r0, sheet.frame, page_h, dpi)
+    if plan is None:
+        sheet.split_error = "Only an isometric view was found on this H2X page - no floor plan."
+        return
+    if _overlap(plan, iso_box):
+        # shrink the plan box away from the isometric if the padding alone causes the overlap
+        plan = _box(ink, c0, r0, sheet.frame, page_h, dpi, pad=1.0)
+        if plan is None or _overlap(plan, iso_box):
+            sheet.split_error = ("The floor plan and the isometric view overlap on this H2X page, so they can't be "
+                                 "shown separately. Move the 3D view clear of the plan in H2X and re-export.")
+            return
+    # trim the isometric to what is actually drawn (the image usually has white margins)
+    iink, ic0, ir0 = _ink(img, iso_box, page_h, dpi)
+    iso_tight = _box(iink, ic0, ir0, iso_box, page_h, dpi, pad=4.0) or iso_box
+    sheet.plan, sheet.iso = plan, iso_tight
 
 
 def analyse(path) -> list[Sheet]:
@@ -121,7 +162,13 @@ def analyse(path) -> list[Sheet]:
                          if w["x0"] >= title[0] - 1 and w["x1"] <= title[2] + 1]
                 lines = _lines(words)
                 _read_title(sheet, lines)
-            sheet.content = _content_box(path, i, frame, H)
+            dpi = 50
+            img = render(Path(path), i, dpi)
+            ink, c0, r0 = _ink(img, frame, H, dpi)
+            sheet.content = _box(ink, c0, r0, frame, H, dpi) or frame
+            images = [(float(im["x0"]), H - float(im["bottom"]), float(im["x1"]), H - float(im["top"]))
+                      for im in p.images]
+            _split(sheet, img, images, H, dpi)
             sheets.append(sheet)
     return sheets
 
